@@ -1,0 +1,38 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Octopus Energy Japan",
+        "description": "Sign in with your Octopus Energy Japan account.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Octopus Energy Japan",
+        "description": "Enter the password for {email} to refresh authentication.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password.",
+      "cannot_connect": "Could not reach the Octopus Energy Japan API.",
+      "unknown": "Unexpected error. Check the logs for details."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Reauthentication successful."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "current_rate": { "name": "Current Rate" },
+      "basic_charge": { "name": "Basic Charge" },
+      "latest_consumption": { "name": "Latest Consumption" },
+      "consumption_today": { "name": "Consumption Today" }
+    }
+  }
+}
