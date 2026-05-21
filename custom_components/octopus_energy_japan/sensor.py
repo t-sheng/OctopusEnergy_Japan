@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from homeassistant.components.sensor import (
+    RestoreSensor,
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
@@ -15,7 +17,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -42,6 +46,7 @@ async def async_setup_entry(
         OctopusJapanBasicChargeSensor(coordinator),
         OctopusJapanLatestConsumptionSensor(coordinator),
         OctopusJapanCumulativeConsumptionSensor(coordinator),
+        OctopusJapanLifetimeConsumptionSensor(coordinator),
     ]
 
     rate_entities: list[SensorEntity] = []
@@ -293,15 +298,151 @@ class OctopusJapanCumulativeConsumptionSensor(_OEJPBaseSensor):
         account = coordinator.account_number or coordinator.entry.entry_id
         mpan = coordinator.agreement.mpan if coordinator.agreement else "unknown"
         self._attr_unique_id = f"{account}_{mpan}_consumption_today"
+        self._last_update_time: datetime | None = None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        value = (self.coordinator.data or {}).get("cumulative_consumption_today_kwh")
+        if value is not None:
+            self._last_update_time = dt_util.now()
+        super()._handle_coordinator_update()
 
     @property
     def native_value(self) -> float | None:
         return (self.coordinator.data or {}).get("cumulative_consumption_today_kwh")
 
     @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "last_update_time": self._last_update_time.isoformat() if self._last_update_time else None,
+        }
+
+    @property
     def last_reset(self) -> datetime | None:  # pragma: no cover
         # TOTAL_INCREASING handles resets implicitly; return None.
         return None
+
+
+class OctopusJapanLifetimeConsumptionSensor(_OEJPBaseSensor, RestoreSensor):
+    """Accumulated total consumption (kWh) since the sensor was first added.
+
+    Captures the last known value of "Consumption Today" before it resets at
+    midnight, then adds it to the running lifetime total which is persisted
+    across Home Assistant restarts via RestoreSensor.
+    """
+
+    _attr_native_unit_of_measurement = UNIT_KWH
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_name = "Lifetime Consumption"
+
+    # Belt-and-suspenders: if today's value drops by more than this threshold
+    # it is treated as a midnight rollover even if the scheduled callback was missed.
+    _ROLLOVER_THRESHOLD = 0.1
+
+    def __init__(self, coordinator: OctopusJapanCoordinator) -> None:
+        super().__init__(coordinator)
+        account = coordinator.account_number or coordinator.entry.entry_id
+        mpan = coordinator.agreement.mpan if coordinator.agreement else "unknown"
+        self._attr_unique_id = f"{account}_{mpan}_lifetime_consumption"
+        self._lifetime_kwh: float = 0.0
+        self._today_max_kwh: float = 0.0
+        self._unsub_midnight = None
+        self._tokyo_tz = ZoneInfo("Asia/Tokyo")
+
+    # ------------------------------------------------------------------
+    # HA lifecycle
+    # ------------------------------------------------------------------
+
+    async def async_added_to_hass(self) -> None:
+        """Restore persisted lifetime total and seed today's max."""
+        await super().async_added_to_hass()
+
+        # Restore the accumulated lifetime total from the last known state.
+        last_state = await self.async_get_last_sensor_data()
+        if last_state is not None and last_state.native_value is not None:
+            try:
+                self._lifetime_kwh = float(last_state.native_value)
+            except (TypeError, ValueError):
+                self._lifetime_kwh = 0.0
+
+        # Seed today's running max from current coordinator data (best-effort on
+        # restart — if we're mid-day this keeps the max roughly correct).
+        today = (self.coordinator.data or {}).get("cumulative_consumption_today_kwh")
+        if today is not None:
+            self._today_max_kwh = float(today)
+
+        self._schedule_midnight()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel the scheduled midnight callback."""
+        if self._unsub_midnight is not None:
+            self._unsub_midnight()
+            self._unsub_midnight = None
+        await super().async_will_remove_from_hass()
+
+    # ------------------------------------------------------------------
+    # Midnight snapshot
+    # ------------------------------------------------------------------
+
+    def _schedule_midnight(self) -> None:
+        """Schedule the next JST midnight snapshot."""
+        if self._unsub_midnight is not None:
+            self._unsub_midnight()
+            self._unsub_midnight = None
+
+        now_local = datetime.now(self._tokyo_tz)
+        next_midnight_local = (now_local + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        self._unsub_midnight = async_track_point_in_time(
+            self.hass,
+            self._handle_midnight,
+            dt_util.as_utc(next_midnight_local),
+        )
+
+    @callback
+    def _handle_midnight(self, _now: datetime) -> None:
+        """Fold today's max consumption into the lifetime total at midnight."""
+        self._unsub_midnight = None
+        if self._today_max_kwh > 0:
+            self._lifetime_kwh += self._today_max_kwh
+        self._today_max_kwh = 0.0
+        self.async_write_ha_state()
+        self._schedule_midnight()
+
+    # ------------------------------------------------------------------
+    # Coordinator updates
+    # ------------------------------------------------------------------
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Track rolling maximum of today's consumption; detect missed rollovers."""
+        today = (self.coordinator.data or {}).get("cumulative_consumption_today_kwh")
+        if today is not None:
+            today = float(today)
+            if today < self._today_max_kwh - self._ROLLOVER_THRESHOLD:
+                # The value dropped significantly — midnight rolled over but the
+                # scheduled callback was missed (e.g. HA was restarting at midnight).
+                self._lifetime_kwh += self._today_max_kwh
+                self._today_max_kwh = today
+            elif today > self._today_max_kwh:
+                self._today_max_kwh = today
+        super()._handle_coordinator_update()
+
+    # ------------------------------------------------------------------
+    # State
+    # ------------------------------------------------------------------
+
+    @property
+    def native_value(self) -> float | None:
+        return round(self._lifetime_kwh, 3)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "today_max_kwh": round(self._today_max_kwh, 3),
+        }
 
 
 def _to_float(value: Any) -> float | None:
