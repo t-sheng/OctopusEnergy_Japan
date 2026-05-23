@@ -36,6 +36,25 @@ Then restart Home Assistant.
 
 **Settings → Devices & Services → Add Integration → Octopus Energy Japan**, then enter the email and password you use for the Octopus Japan customer portal.
 
+## Branding (Home Assistant UI icon/logo)
+
+This integration includes local Home Assistant brand assets in:
+
+```
+custom_components/octopus_energy_japan/brand/
+```
+
+Files included:
+
+- `icon.png` (256x256)
+- `icon@2x.png` (512x512)
+- `logo.png`
+- `logo@2x.png`
+
+On Home Assistant `2026.3+`, these local brand images are discovered automatically from the integration domain (`octopus_energy_japan`) and shown in the UI via Home Assistant's brands API. No extra manifest keys are required.
+
+For older Home Assistant versions, custom integrations may still depend on hosted brand assets from the Home Assistant brands repository matching the same domain. If you need strict pre-`2026.3` parity, publish matching assets for `octopus_energy_japan` in `home-assistant/brands`.
+
 ## Sensors created
 
 | Sensor | Unit | Notes |
