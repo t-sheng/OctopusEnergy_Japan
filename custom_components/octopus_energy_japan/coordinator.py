@@ -88,6 +88,8 @@ class OctopusJapanCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.account_number, self.agreement
                 )
 
+            daily_readings = await self.client.get_daily_consumption_readings(self.account_number)
+
             # Pull a rolling 48 h window of half-hour readings so the energy
             # dashboard has overlap with prior polls.
             now_utc = datetime.now(timezone.utc)
@@ -119,6 +121,11 @@ class OctopusJapanCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             datetime.now(timezone.utc) - timedelta(hours=24),
         )
 
+        daily_today = daily_readings[0] if daily_readings else None
+        daily_yesterday = daily_readings[1] if len(daily_readings) > 1 else None
+        if daily_today and daily_today.get("value") is not None:
+            cumulative_today = daily_today.get("value")
+
         # Schedule a one-shot refresh at the next TOU boundary so the
         # current-rate sensor flips on the dot.
         self._schedule_next_boundary(tariff_data["rates"])
@@ -131,6 +138,9 @@ class OctopusJapanCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "consumption": readings,
             "latest_consumption": latest,
             "cumulative_consumption_today_kwh": cumulative_today,
+            "cumulative_consumption_yesterday_kwh": daily_yesterday.get("value") if daily_yesterday else None,
+            "daily_consumption_today": daily_today,
+            "daily_consumption_yesterday": daily_yesterday,
             "rolling_24h_consumption_kwh": rolling_24h,
             "account_number": self.account_number,
             "mpan": self.agreement.mpan if self.agreement else None,

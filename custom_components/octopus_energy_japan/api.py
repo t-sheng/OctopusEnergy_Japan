@@ -138,6 +138,56 @@ query halfHourlyReadings($accountNumber: String!, $fromDatetime: DateTime, $toDa
 }
 """
 
+_SUPPLY_POINTS = """
+query supplyPoints($accountNumber: String!) {
+    supplyPoints(accountNumber: $accountNumber, first: 20) {
+        edges {
+            node {
+                id
+                externalIdentifier
+                marketName
+            }
+        }
+    }
+}
+"""
+
+_SUPPLY_POINT_DAILY_READINGS = """
+query supplyPointDailyReadings(
+    $externalIdentifier: String!
+    $marketName: String!
+    $startAt: DateTime!
+    $endAt: DateTime!
+) {
+    supplyPoint(externalIdentifier: $externalIdentifier, marketName: $marketName) {
+        id
+        externalIdentifier
+        marketName
+        readings(
+            startAt: $startAt
+            endAt: $endAt
+            readingType: INTERVAL
+            timeGranularity: DAY
+            timezone: "Asia/Tokyo"
+            units: [KILOWATT_HOURS]
+        ) {
+            importReadings(first: 100) {
+                totalCount
+                edgeCount
+                edges {
+                    node {
+                        value
+                        units
+                        intervalStart
+                        intervalEnd
+                    }
+                }
+            }
+        }
+    }
+}
+"""
+
 _INTROSPECT_TYPE = """
 query introspectType($name: String!) {
   __type(name: $name) {
@@ -567,6 +617,51 @@ class KrakenClient:
                         }
                     )
         readings.sort(key=lambda r: r["start_at"] or "")
+        return readings
+
+    async def get_daily_consumption_readings(self, account_number: str) -> list[dict[str, Any]]:
+        supply_points = await self.gql(_SUPPLY_POINTS, {"accountNumber": account_number})
+        edges = (supply_points.get("supplyPoints") or {}).get("edges") or []
+        if not edges:
+            return []
+
+        node = (edges[0] or {}).get("node") or {}
+        external_identifier = node.get("externalIdentifier")
+        market_name = node.get("marketName")
+        if not external_identifier or not market_name:
+            return []
+
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(days=7)
+        data = await self.gql(
+            _SUPPLY_POINT_DAILY_READINGS,
+            {
+                "externalIdentifier": external_identifier,
+                "marketName": market_name,
+                "startAt": start.isoformat(),
+                "endAt": now.isoformat(),
+            },
+        )
+
+        readings: list[dict[str, Any]] = []
+        supply_point = data.get("supplyPoint") or {}
+        import_readings = (supply_point.get("readings") or {}).get("importReadings") or {}
+        for reading in import_readings.get("edges") or []:
+            node = (reading or {}).get("node") or {}
+            value = node.get("value")
+            try:
+                value_f = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                value_f = None
+            readings.append(
+                {
+                    "start_at": node.get("intervalStart"),
+                    "end_at": node.get("intervalEnd"),
+                    "value": value_f,
+                }
+            )
+
+        readings.sort(key=lambda r: r["start_at"] or "", reverse=True)
         return readings
 
 

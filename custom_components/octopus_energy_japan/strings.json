@@ -30,9 +30,10 @@
   "entity": {
     "sensor": {
       "current_rate": { "name": "Current Rate" },
-      "basic_charge": { "name": "Basic Charge" },
       "latest_consumption": { "name": "Latest Consumption" },
-      "consumption_today": { "name": "Consumption Today" }
+      "consumption_today": { "name": "Consumption Today" },
+      "consumption_yesterday": { "name": "Consumption Yesterday" },
+      "basic_charge": { "name": "Basic Charge" }
     }
   }
 }

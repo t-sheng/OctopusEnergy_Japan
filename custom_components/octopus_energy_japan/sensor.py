@@ -5,7 +5,6 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from homeassistant.components.sensor import (
     RestoreSensor,
@@ -17,7 +16,6 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
@@ -43,23 +41,23 @@ async def async_setup_entry(
 
     base_entities: list[SensorEntity] = [
         OctopusJapanCurrentRateSensor(coordinator),
-        OctopusJapanBasicChargeSensor(coordinator),
         OctopusJapanLatestConsumptionSensor(coordinator),
         OctopusJapanCumulativeConsumptionSensor(coordinator),
+        OctopusJapanYesterdayConsumptionSensor(coordinator),
         OctopusJapanLifetimeConsumptionSensor(coordinator),
     ]
 
     rate_entities: list[SensorEntity] = []
-    for slug in (coordinator.data or {}).get("rates", {}):
+    for slug in sorted((coordinator.data or {}).get("rates", {}), key=_rate_sort_key):
         rate_entities.append(OctopusJapanRateSensor(coordinator, slug))
         known_rate_slugs.add(slug)
 
-    async_add_entities([*base_entities, *rate_entities])
+    async_add_entities([*base_entities, *rate_entities, OctopusJapanBasicChargeSensor(coordinator)])
 
     @callback
     def _maybe_add_new_rate_sensors() -> None:
         rates = (coordinator.data or {}).get("rates", {})
-        new_slugs = [s for s in rates if s not in known_rate_slugs]
+        new_slugs = sorted([s for s in rates if s not in known_rate_slugs], key=_rate_sort_key)
         if not new_slugs:
             return
         new_entities = [OctopusJapanRateSensor(coordinator, slug) for slug in new_slugs]
@@ -103,7 +101,7 @@ class OctopusJapanRateSensor(_OEJPBaseSensor):
         super().__init__(coordinator)
         self._slug = slug
         rate = (coordinator.data or {}).get("rates", {}).get(slug, {})
-        label = rate.get("label") or slug.replace("_", " ").title()
+        label = _format_rate_label(rate.get("label") or slug.replace("_", " ").title())
         self._attr_name = f"{label} Rate"
         account = coordinator.account_number or coordinator.entry.entry_id
         mpan = coordinator.agreement.mpan if coordinator.agreement else "unknown"
@@ -323,12 +321,47 @@ class OctopusJapanCumulativeConsumptionSensor(_OEJPBaseSensor):
         return None
 
 
+class OctopusJapanYesterdayConsumptionSensor(_OEJPBaseSensor):
+    """Previous day's consumption total (kWh)."""
+
+    _attr_native_unit_of_measurement = UNIT_KWH
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_name = "Consumption Yesterday"
+
+    def __init__(self, coordinator: OctopusJapanCoordinator) -> None:
+        super().__init__(coordinator)
+        account = coordinator.account_number or coordinator.entry.entry_id
+        mpan = coordinator.agreement.mpan if coordinator.agreement else "unknown"
+        self._attr_unique_id = f"{account}_{mpan}_consumption_yesterday"
+
+    def _data(self) -> dict[str, Any] | None:
+        return (self.coordinator.data or {}).get("daily_consumption_yesterday")
+
+    @property
+    def available(self) -> bool:
+        return super().available and bool(self._data())
+
+    @property
+    def native_value(self) -> float | None:
+        data = self._data()
+        return _to_float(data.get("value")) if data else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self._data() or {}
+        return {
+            "start_at": data.get("start_at"),
+            "end_at": data.get("end_at"),
+        }
+
+
 class OctopusJapanLifetimeConsumptionSensor(_OEJPBaseSensor, RestoreSensor):
     """Accumulated total consumption (kWh) since the sensor was first added.
 
-    Captures the last known value of "Consumption Today" before it resets at
-    midnight, then adds it to the running lifetime total which is persisted
-    across Home Assistant restarts via RestoreSensor.
+    Accumulates the previous day's mature total once it has stabilized, then
+    persists the running lifetime total across Home Assistant restarts via
+    RestoreSensor.
     """
 
     _attr_native_unit_of_measurement = UNIT_KWH
@@ -336,26 +369,21 @@ class OctopusJapanLifetimeConsumptionSensor(_OEJPBaseSensor, RestoreSensor):
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_name = "Lifetime Consumption"
 
-    # Belt-and-suspenders: if today's value drops by more than this threshold
-    # it is treated as a midnight rollover even if the scheduled callback was missed.
-    _ROLLOVER_THRESHOLD = 0.1
-
     def __init__(self, coordinator: OctopusJapanCoordinator) -> None:
         super().__init__(coordinator)
         account = coordinator.account_number or coordinator.entry.entry_id
         mpan = coordinator.agreement.mpan if coordinator.agreement else "unknown"
         self._attr_unique_id = f"{account}_{mpan}_lifetime_consumption"
         self._lifetime_kwh: float = 0.0
-        self._today_max_kwh: float = 0.0
-        self._unsub_midnight = None
-        self._tokyo_tz = ZoneInfo("Asia/Tokyo")
+        self._last_seen_previous_day_key: str | None = None
+        self._last_applied_previous_day_key: str | None = None
 
     # ------------------------------------------------------------------
     # HA lifecycle
     # ------------------------------------------------------------------
 
     async def async_added_to_hass(self) -> None:
-        """Restore persisted lifetime total and seed today's max."""
+        """Restore persisted lifetime total and the last matured day value."""
         await super().async_added_to_hass()
 
         # Restore the accumulated lifetime total from the last known state.
@@ -366,50 +394,10 @@ class OctopusJapanLifetimeConsumptionSensor(_OEJPBaseSensor, RestoreSensor):
             except (TypeError, ValueError):
                 self._lifetime_kwh = 0.0
 
-        # Seed today's running max from current coordinator data (best-effort on
-        # restart — if we're mid-day this keeps the max roughly correct).
-        today = (self.coordinator.data or {}).get("cumulative_consumption_today_kwh")
-        if today is not None:
-            self._today_max_kwh = float(today)
-
-        self._schedule_midnight()
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Cancel the scheduled midnight callback."""
-        if self._unsub_midnight is not None:
-            self._unsub_midnight()
-            self._unsub_midnight = None
-        await super().async_will_remove_from_hass()
-
-    # ------------------------------------------------------------------
-    # Midnight snapshot
-    # ------------------------------------------------------------------
-
-    def _schedule_midnight(self) -> None:
-        """Schedule the next JST midnight snapshot."""
-        if self._unsub_midnight is not None:
-            self._unsub_midnight()
-            self._unsub_midnight = None
-
-        now_local = datetime.now(self._tokyo_tz)
-        next_midnight_local = (now_local + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        self._unsub_midnight = async_track_point_in_time(
-            self.hass,
-            self._handle_midnight,
-            dt_util.as_utc(next_midnight_local),
-        )
-
-    @callback
-    def _handle_midnight(self, _now: datetime) -> None:
-        """Fold today's max consumption into the lifetime total at midnight."""
-        self._unsub_midnight = None
-        if self._today_max_kwh > 0:
-            self._lifetime_kwh += self._today_max_kwh
-        self._today_max_kwh = 0.0
-        self.async_write_ha_state()
-        self._schedule_midnight()
+        attributes = getattr(last_state, "attributes", {}) if last_state is not None else {}
+        last_applied = attributes.get("last_applied_previous_day_key")
+        if last_applied is not None:
+            self._last_applied_previous_day_key = str(last_applied)
 
     # ------------------------------------------------------------------
     # Coordinator updates
@@ -417,17 +405,22 @@ class OctopusJapanLifetimeConsumptionSensor(_OEJPBaseSensor, RestoreSensor):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Track rolling maximum of today's consumption; detect missed rollovers."""
-        today = (self.coordinator.data or {}).get("cumulative_consumption_today_kwh")
-        if today is not None:
-            today = float(today)
-            if today < self._today_max_kwh - self._ROLLOVER_THRESHOLD:
-                # The value dropped significantly — midnight rolled over but the
-                # scheduled callback was missed (e.g. HA was restarting at midnight).
-                self._lifetime_kwh += self._today_max_kwh
-                self._today_max_kwh = today
-            elif today > self._today_max_kwh:
-                self._today_max_kwh = today
+        """Add the previous day's total only after it has stabilized."""
+        data = self.coordinator.data or {}
+        yesterday_data = data.get("daily_consumption_yesterday") or {}
+        previous_day_value = _to_float(data.get("cumulative_consumption_yesterday_kwh"))
+        yesterday_sensor_value = _to_float(yesterday_data.get("value"))
+        previous_day_key = str(yesterday_data.get("end_at") or yesterday_data.get("start_at") or "")
+
+        if previous_day_value is not None and previous_day_value == yesterday_sensor_value:
+            if (
+                self._last_seen_previous_day_key is not None
+                and previous_day_key == self._last_seen_previous_day_key
+                and previous_day_key != self._last_applied_previous_day_key
+            ):
+                self._lifetime_kwh += previous_day_value
+                self._last_applied_previous_day_key = previous_day_key
+            self._last_seen_previous_day_key = previous_day_key
         super()._handle_coordinator_update()
 
     # ------------------------------------------------------------------
@@ -441,7 +434,8 @@ class OctopusJapanLifetimeConsumptionSensor(_OEJPBaseSensor, RestoreSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {
-            "today_max_kwh": round(self._today_max_kwh, 3),
+            "last_seen_previous_day_key": self._last_seen_previous_day_key,
+            "last_applied_previous_day_key": self._last_applied_previous_day_key,
         }
 
 
@@ -452,6 +446,23 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _format_rate_label(label: str) -> str:
+    if label.startswith("Ev "):
+        return "EV " + label[3:]
+    if label == "Ev":
+        return "EV"
+    return label
+
+
+def _rate_sort_key(slug: str) -> tuple[int, str]:
+    priority = {
+        "standard": 0,
+        "ev_day_time": 1,
+        "ev_night_time": 2,
+    }
+    return priority.get(slug, 99), slug
 
 
 def _basic_charge_to_daily_jpy(value: float | None, unit: str | None) -> float | None:
