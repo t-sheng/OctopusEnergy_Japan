@@ -249,7 +249,6 @@ class OctopusJapanLatestConsumptionSensor(_OEJPBaseSensor):
 
     _attr_native_unit_of_measurement = UNIT_KWH
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_name = "Latest Consumption"
 
     def __init__(self, coordinator: OctopusJapanCoordinator) -> None:
@@ -326,7 +325,6 @@ class OctopusJapanYesterdayConsumptionSensor(_OEJPBaseSensor):
 
     _attr_native_unit_of_measurement = UNIT_KWH
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_name = "Consumption Yesterday"
 
     def __init__(self, coordinator: OctopusJapanCoordinator) -> None:
