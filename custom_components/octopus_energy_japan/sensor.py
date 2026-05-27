@@ -348,18 +348,21 @@ class OctopusJapanYesterdayConsumptionSensor(_OEJPBaseSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         data = self._data() or {}
+        coordinator_data = self.coordinator.data or {}
         return {
             "start_at": data.get("start_at"),
             "end_at": data.get("end_at"),
+            "day_key": coordinator_data.get("daily_consumption_yesterday_day_key"),
+            "is_final": coordinator_data.get("daily_consumption_yesterday_is_final", False),
+            "stable_polls": coordinator_data.get("daily_consumption_yesterday_stable_polls", 0),
         }
 
 
 class OctopusJapanLifetimeConsumptionSensor(_OEJPBaseSensor, RestoreSensor):
     """Accumulated total consumption (kWh) since the sensor was first added.
 
-    Accumulates the previous day's mature total once it has stabilized, then
-    persists the running lifetime total across Home Assistant restarts via
-    RestoreSensor.
+    Accumulates only finalized previous-day totals and persists the running
+    lifetime total across Home Assistant restarts via RestoreSensor.
     """
 
     _attr_native_unit_of_measurement = UNIT_KWH
@@ -373,8 +376,8 @@ class OctopusJapanLifetimeConsumptionSensor(_OEJPBaseSensor, RestoreSensor):
         mpan = coordinator.agreement.mpan if coordinator.agreement else "unknown"
         self._attr_unique_id = f"{account}_{mpan}_lifetime_consumption"
         self._lifetime_kwh: float = 0.0
-        self._last_seen_previous_day_key: str | None = None
         self._last_applied_previous_day_key: str | None = None
+        self._last_applied_previous_day_value: float | None = None
 
     # ------------------------------------------------------------------
     # HA lifecycle
@@ -393,9 +396,13 @@ class OctopusJapanLifetimeConsumptionSensor(_OEJPBaseSensor, RestoreSensor):
                 self._lifetime_kwh = 0.0
 
         attributes = getattr(last_state, "attributes", {}) if last_state is not None else {}
-        last_applied = attributes.get("last_applied_previous_day_key")
-        if last_applied is not None:
-            self._last_applied_previous_day_key = str(last_applied)
+        last_applied_key = attributes.get("last_applied_previous_day_key")
+        if last_applied_key is not None:
+            self._last_applied_previous_day_key = str(last_applied_key)
+
+        last_applied_value = _to_float(attributes.get("last_applied_previous_day_value"))
+        if last_applied_value is not None:
+            self._last_applied_previous_day_value = last_applied_value
 
     # ------------------------------------------------------------------
     # Coordinator updates
@@ -403,22 +410,23 @@ class OctopusJapanLifetimeConsumptionSensor(_OEJPBaseSensor, RestoreSensor):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Add the previous day's total only after it has stabilized."""
+        """Add finalized previous-day totals exactly once per day key."""
         data = self.coordinator.data or {}
         yesterday_data = data.get("daily_consumption_yesterday") or {}
-        previous_day_value = _to_float(data.get("cumulative_consumption_yesterday_kwh"))
-        yesterday_sensor_value = _to_float(yesterday_data.get("value"))
-        previous_day_key = str(yesterday_data.get("end_at") or yesterday_data.get("start_at") or "")
+        previous_day_value = _to_float(yesterday_data.get("value"))
+        previous_day_key = data.get("daily_consumption_yesterday_day_key")
+        previous_day_is_final = bool(data.get("daily_consumption_yesterday_is_final"))
 
-        if previous_day_value is not None and previous_day_value == yesterday_sensor_value:
-            if (
-                self._last_seen_previous_day_key is not None
-                and previous_day_key == self._last_seen_previous_day_key
-                and previous_day_key != self._last_applied_previous_day_key
-            ):
+        if previous_day_key and previous_day_value is not None and previous_day_is_final:
+            if previous_day_key != self._last_applied_previous_day_key:
                 self._lifetime_kwh += previous_day_value
                 self._last_applied_previous_day_key = previous_day_key
-            self._last_seen_previous_day_key = previous_day_key
+                self._last_applied_previous_day_value = previous_day_value
+            elif self._last_applied_previous_day_value is not None:
+                delta = previous_day_value - self._last_applied_previous_day_value
+                if delta != 0:
+                    self._lifetime_kwh += delta
+                    self._last_applied_previous_day_value = previous_day_value
         super()._handle_coordinator_update()
 
     # ------------------------------------------------------------------
@@ -432,8 +440,8 @@ class OctopusJapanLifetimeConsumptionSensor(_OEJPBaseSensor, RestoreSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {
-            "last_seen_previous_day_key": self._last_seen_previous_day_key,
             "last_applied_previous_day_key": self._last_applied_previous_day_key,
+            "last_applied_previous_day_value": self._last_applied_previous_day_value,
         }
 
 

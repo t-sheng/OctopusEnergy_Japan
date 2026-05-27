@@ -33,6 +33,7 @@
       "latest_consumption": { "name": "Latest Consumption" },
       "consumption_today": { "name": "Consumption Today" },
       "consumption_yesterday": { "name": "Consumption Yesterday" },
+      "lifetime_consumption": { "name": "Lifetime Consumption" },
       "basic_charge": { "name": "Basic Charge" }
     }
   }
