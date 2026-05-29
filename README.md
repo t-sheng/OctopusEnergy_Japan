@@ -11,9 +11,7 @@ Each unit rate the API returns for your active tariff is exposed as its own sens
 - A `Current Rate` sensor that resolves to whichever time-of-use period is active in `Asia/Tokyo` right now, refreshes the moment a TOU window flips, and includes a fixed per-slot basic-charge component (`basic_charge_per_day / 48`).
 - A `Basic Charge` sensor in the unit the API returns (per month / per day).
 - A `Latest Consumption` sensor (kWh) showing the most recent half-hourly reading.
-- A `Consumption Today` sensor (kWh, `total_increasing`) sourced from the daily totals API and wired up for the Home Assistant Energy dashboard.
-- A `Consumption Yesterday` sensor (kWh) with attributes showing whether the value is considered final.
-- A `Lifetime Consumption` sensor (kWh, `total_increasing`) that accumulates only finalized `Consumption Yesterday` values.
+- A `Consumption Today` sensor (kWh, `total_increasing`) wired up for the Home Assistant Energy dashboard.
 - Token refresh handled transparently; reauth flow prompts for the password if the refresh token is rejected.
 
 ## Installation
@@ -65,20 +63,9 @@ For older Home Assistant versions, custom integrations may still depend on hoste
 | `sensor.octopus_energy_japan_current_rate` | `JPY/kWh` | Active Asia/Tokyo unit rate with an added fixed per-30-minute basic-charge component (`basic_charge_per_day / 48`). |
 | `sensor.octopus_energy_japan_basic_charge` | `JPY/month` or `JPY/day` | Basic / standing charge. |
 | `sensor.octopus_energy_japan_latest_consumption` | `kWh` | Most recent half-hourly reading. |
-| `sensor.octopus_energy_japan_consumption_today` | `kWh` | Daily total from the API for today (falls back to half-hourly sum when unavailable); `total_increasing` for the Energy dashboard. |
-| `sensor.octopus_energy_japan_consumption_yesterday` | `kWh` | Daily total from the API for yesterday. Attributes include `day_key`, `is_final`, and `stable_polls` to indicate finality progress. |
-| `sensor.octopus_energy_japan_lifetime_consumption` | `kWh` | Running sum of finalized yesterday totals only. Excludes today's consumption by design. |
+| `sensor.octopus_energy_japan_consumption_today` | `kWh` | Cumulative since local midnight; `total_increasing` for the Energy dashboard. |
 
 Rate-like sensor values are exposed rounded to 2 decimal places.
-
-### Yesterday Finality Logic
-
-`Consumption Yesterday` is treated as provisional until the backend has likely caught up.
-
-- `is_final` becomes `true` once either:
-  - the reading is at least two local-calendar days old, or
-  - it is the day after the reading and the value has stayed unchanged for at least two polls after 23:00 JST.
-- `Lifetime Consumption` only applies yesterday values when `is_final` is `true`, and it stores day-level bookkeeping to avoid duplicate additions across restarts.
 
 ## Troubleshooting
 

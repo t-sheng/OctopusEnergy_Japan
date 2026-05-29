@@ -53,9 +53,6 @@ class OctopusJapanCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.agreement: Agreement | None = None
         self._tokyo_tz = ZoneInfo(TZ_TOKYO)
         self._unsub_boundary = None
-        self._yesterday_day_key: str | None = None
-        self._yesterday_value: float | None = None
-        self._yesterday_stable_polls: int = 0
 
     async def _async_setup(self) -> None:
         """One-shot setup: resolve account + active agreement."""
@@ -126,28 +123,6 @@ class OctopusJapanCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         daily_today = daily_readings[0] if daily_readings else None
         daily_yesterday = daily_readings[1] if len(daily_readings) > 1 else None
-        yesterday_day_key = _day_key_from_reading(daily_yesterday)
-        yesterday_value = _reading_value(daily_yesterday)
-        if yesterday_day_key and yesterday_day_key == self._yesterday_day_key:
-            if yesterday_value is not None and yesterday_value == self._yesterday_value:
-                self._yesterday_stable_polls += 1
-            else:
-                self._yesterday_stable_polls = 1
-        elif yesterday_day_key:
-            self._yesterday_stable_polls = 1
-        else:
-            self._yesterday_stable_polls = 0
-
-        self._yesterday_day_key = yesterday_day_key
-        self._yesterday_value = yesterday_value
-
-        yesterday_is_final = _is_yesterday_final(
-            daily_yesterday,
-            now_local=datetime.now(self._tokyo_tz),
-            stable_polls=self._yesterday_stable_polls,
-            tz=self._tokyo_tz,
-        )
-
         if daily_today and daily_today.get("value") is not None:
             cumulative_today = daily_today.get("value")
 
@@ -166,9 +141,6 @@ class OctopusJapanCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "cumulative_consumption_yesterday_kwh": daily_yesterday.get("value") if daily_yesterday else None,
             "daily_consumption_today": daily_today,
             "daily_consumption_yesterday": daily_yesterday,
-            "daily_consumption_yesterday_day_key": yesterday_day_key,
-            "daily_consumption_yesterday_is_final": yesterday_is_final,
-            "daily_consumption_yesterday_stable_polls": self._yesterday_stable_polls,
             "rolling_24h_consumption_kwh": rolling_24h,
             "account_number": self.account_number,
             "mpan": self.agreement.mpan if self.agreement else None,
@@ -327,67 +299,3 @@ def _sum_readings_since_utc(
             total += value
             found = True
     return total if found else None
-
-
-def _reading_value(reading: dict[str, Any] | None) -> float | None:
-    if not reading:
-        return None
-    value = reading.get("value")
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _day_key_from_reading(reading: dict[str, Any] | None) -> str | None:
-    if not reading:
-        return None
-    for field in ("start_at", "end_at"):
-        dt = _parse_iso_datetime(reading.get(field))
-        if dt is not None:
-            return dt.date().isoformat()
-    return None
-
-
-def _is_yesterday_final(
-    reading: dict[str, Any] | None,
-    *,
-    now_local: datetime,
-    stable_polls: int,
-    tz: ZoneInfo,
-) -> bool:
-    if not reading or _reading_value(reading) is None:
-        return False
-
-    day_start = _parse_iso_datetime(reading.get("start_at"))
-    day_end = _parse_iso_datetime(reading.get("end_at"))
-    if day_start is None and day_end is None:
-        return False
-
-    reference_dt = day_end or day_start
-    assert reference_dt is not None
-    ref_local = reference_dt.astimezone(tz)
-    day_date = ref_local.date()
-
-    is_day_after = now_local.date() == day_date + timedelta(days=1)
-    is_two_or_more_days_after = now_local.date() >= day_date + timedelta(days=2)
-
-    if is_two_or_more_days_after:
-        return True
-
-    if is_day_after and now_local.time() >= time(23, 0) and stable_polls >= 2:
-        return True
-
-    return False
-
-
-def _parse_iso_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed
