@@ -300,6 +300,7 @@ class KrakenClient:
         self._account_agreement_field: str | None = None
         self._account_agreement_field_resolved = False
         self._tariff_field_cache: dict[str, str | None] = {}
+        self._consecutive_refresh_rejections = 0
 
     # ---------------------------------------------------------------- auth
 
@@ -308,16 +309,30 @@ class KrakenClient:
         return self._token.refresh_token if self._token else None
 
     async def _login_with_password(self) -> TokenInfo:
-        return await self._obtain_token({"email": self._email, "password": self._password})
+        LOGGER.debug("Authenticating with password token flow")
+        return await self._obtain_token(
+            {"email": self._email, "password": self._password},
+            token_flow="password",
+        )
 
     async def _refresh_with_token(self, refresh_token: str) -> TokenInfo:
-        return await self._obtain_token({"refreshToken": refresh_token})
+        LOGGER.debug("Attempting refresh-token authentication")
+        return await self._obtain_token(
+            {"refreshToken": refresh_token},
+            token_flow="refresh",
+        )
 
-    async def _obtain_token(self, variables_input: dict[str, str]) -> TokenInfo:
+    async def _obtain_token(
+        self,
+        variables_input: dict[str, str],
+        *,
+        token_flow: str,
+    ) -> TokenInfo:
         data = await self._raw_request(
             _OBTAIN_TOKEN,
             variables={"input": variables_input},
             authenticated=False,
+            auth_context=f"token_{token_flow}",
         )
         payload_data = data.get("obtainKrakenToken")
         if not payload_data or not payload_data.get("token"):
@@ -350,12 +365,28 @@ class KrakenClient:
             if self._token and self._token.refresh_token:
                 try:
                     info = await self._refresh_with_token(self._token.refresh_token)
+                    self._consecutive_refresh_rejections = 0
+                    LOGGER.debug("Refresh-token authentication succeeded")
                     return info.token
                 except KrakenAuthError as err:
-                    LOGGER.debug("Refresh-token rejected, falling back to password login: %s", err)
+                    self._consecutive_refresh_rejections += 1
+                    LOGGER.debug("Refresh-token authentication rejected, falling back to password login: %s", err)
+                    if self._consecutive_refresh_rejections >= 3:
+                        LOGGER.warning(
+                            "Refresh token has been rejected %d consecutive times; reauthentication may be required",
+                            self._consecutive_refresh_rejections,
+                        )
+                    # Discard the stale token so fallback always performs a clean password login.
+                    self._token = None
 
-            info = await self._login_with_password()
-            return info.token
+            try:
+                info = await self._login_with_password()
+                self._consecutive_refresh_rejections = 0
+                LOGGER.debug("Password-token authentication succeeded")
+                return info.token
+            except KrakenAuthError as err:
+                LOGGER.debug("Password-token authentication failed")
+                raise KrakenAuthError("Authentication failed after refresh fallback") from err
 
     # --------------------------------------------------------------- core
 
@@ -365,6 +396,7 @@ class KrakenClient:
         *,
         variables: dict[str, Any] | None = None,
         authenticated: bool = True,
+        auth_context: str | None = None,
     ) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
         if authenticated:
@@ -389,7 +421,9 @@ class KrakenClient:
         if "errors" in payload and payload["errors"]:
             messages = [str(e.get("message", e)) for e in payload["errors"]]
             joined = "; ".join(messages)
-            if any(_looks_like_auth_error(m) for m in messages):
+            if any(_looks_like_auth_error(m) for m in messages) or any(
+                _looks_like_token_flow_auth_error(m, auth_context) for m in messages
+            ):
                 raise KrakenAuthError(joined)
             raise KrakenError(joined)
 
@@ -678,6 +712,20 @@ def _looks_like_auth_error(message: str) -> bool:
         or "invalid token" in lowered
         or "unauthor" in lowered
     )
+
+
+def _looks_like_token_flow_auth_error(message: str, auth_context: str | None) -> bool:
+    """Classify backend-generic token endpoint errors as auth failures.
+
+    Some token mutations return opaque messages like "Invalid data." instead
+    of explicit auth codes when refresh tokens expire or are revoked.
+    Restrict this heuristic to token obtain flows to avoid misclassifying
+    ordinary data-query failures.
+    """
+    if auth_context not in {"token_refresh", "token_password"}:
+        return False
+    lowered = message.lower().strip()
+    return lowered in {"invalid data.", "invalid data"}
 
 
 def _build_tariff_rate_query(
